@@ -1,0 +1,272 @@
+---
+title: "PM 591 Final Project"
+author: "Zoe Tsokolas"
+date: "2025-04-09"
+output: html_document
+---
+
+## wd
+```{r}
+
+setwd("/Volumes/USC 2025/NGP/PM591/ML_ABPos_WMH_FinalProject")
+
+library("mlr3")
+library("mlr3learners")
+library("mlr3tuning")
+library("ggplot2")
+library("paradox")
+library("mlr3viz")
+library("fastDummies")
+library("dplyr")
+
+```
+
+- goal is to build a predictive model using real data
+- describe problem, modeling approaches, and results
+- use 3 distinct, appropriate methods
+- describe splitting of data into train/test and any resampling strategy like cross validation used for comparing models, tuning, or feature selection
+- describe the model/feature selection procedures
+- describe tuning parameters and my tuning approach
+- describe performance metrics used and my choices (ex. AUC). 
+- provide key data summaries using tables and or plots (plots preferred) (such as class frequencies if doing classification) 
+- report training, validation/CV, and test errors
+- include CV plots, variable importance measures (p vals, model coefficients, feature importance from tree based models)
+- do the predictive models developed achieved sufficient accuracy to be useful for predicting new observations? this is based on 1. practical utility of the model, 2. strengths and limitations, and 3. possible improvements or extensions
+
+## data cleaning / preprocessing
+```{r}
+
+data <- read.csv("HD1_data_r6_cleaned_merged - HD1_data_r6_cleaned_merged.csv")
+CUdata <- data[data$CDX_Cog == 0, ]
+table(CUdata$CDX_Cog)
+
+# converting E4 status and Amyloid Positivity to single binary feature 
+# otherwise ML models interpret E4 = 0 and E4 = 1 in same person (everyone has a value of E4- or E4+ = ex. they'll have "1" for the feature APOE4_Positivity.X0 if they're E4- but ALSO have "0" encoded for feature APOE4_Positivity.X1... so ML models might "double count")
+CUdata$APOE4_Positive <- ifelse(CUdata$APOE4_Positivity == "1", 1, 0)
+CUdata$X01_AB_FBB_AB_pos <- ifelse(CUdata$X01_AB_FBB_AB_pos == "1", 1, 0)
+# scanner had extra empty string of "" w/no values, removing it
+CUdata$X01_AB_FBB_Scanner<-as.character(droplevels(as.factor(CUdata$X01_AB_FBB_Scanner)))
+# inspecting continous data using shapiro wilk test
+shapiro.test(CUdata$X02_WMH_Volume_Raw)
+shapiro.test(CUdata$Age)
+shapiro.test(CUdata$X01_ICV_HD)
+shapiro.test(CUdata$ID_Education)
+shapiro.test(CUdata$BW_HDLChol)
+shapiro.test(CUdata$BW_LDLchol)
+shapiro.test(CUdata$BW_Cholhdlcratio)
+shapiro.test(CUdata$BW_Triglycerides)
+shapiro.test(CUdata$OM_BMI)
+shapiro.test(CUdata$CDX_Diabetes)
+shapiro.test(CUdata$BW_HBA1c)
+shapiro.test(CUdata$IMH_Diabetes)
+shapiro.test(CUdata$OM_AbCircumference)
+## log-transforming non-normally distributed variables (W = close to 1 in test above = pretty normal)
+CUdata$X02_WMH_Volume_LOGGED <- log10(CUdata$X02_WMH_Volume_Raw + 1)
+CUdata <- CUdata %>% mutate(CDX_Diabetes=case_when(
+  BW_HBA1c >= 6.5 | IMH_Diabetes == 1 ~ "1",
+  IMH_Diabetes == 0 & BW_HBA1c < 6.5 ~ "0"
+))
+CUdata <- CUdata %>% mutate(CDX_Diabetes = case_when(
+  BW_HBA1c >= 6.5 | IMH_Diabetes == 1 ~ "1",
+  DA_Aware == 1 ~ "1",  
+  IMH_Diabetes == 0 & BW_HBA1c < 6.5 ~ "0",
+  TRUE ~ CDX_Diabetes
+))
+CUdata <- CUdata %>% filter(!is.na(CDX_Diabetes))
+CUdata_check <- CUdata %>% filter(CDX_Diabetes == "0" & DA_Aware == 1)
+
+variables <- c("Med_ID", "Age", "ID_Gender", "Ethnicity", "ID_Education", "ID_Hispanic", "X01_AB_FBB_AB_pos", "X01_AB_FBB_Scanner", "X02_WMH_Volume_LOGGED", "X01_ICV_HD", "APOE4_Positivity", "BW_HDLChol", "BW_LDLchol", "BW_Cholhdlcratio", "BW_Triglycerides", "OM_BMI", "CDX_Diabetes", "BW_HBA1c", "IMH_Diabetes", "CDX_Hypertension", "Smoke_Ever", "OM_AbCircumference")
+final_doc <- CUdata[complete.cases(CUdata[, variables]), variables]
+final_doc <- droplevels(final_doc) # dropping unused levels from factor variables
+nrow(final_doc)  
+any(is.na(final_doc)) # should be FALSE
+
+# recoding factors with 2 levels (binary) to numeric (ENet and XGBoost expect numeric input, not factors)
+final_doc$ID_Gender <- ifelse(final_doc$ID_Gender == "Female", 1, 0) # male == 0, female == 1
+final_doc$X01_AB_FBB_Scanner <- ifelse(final_doc$X01_AB_FBB_Scanner == "Vision", 1, 0) # MCT20 == 0, vision ==1
+final_doc$ID_Hispanic <- ifelse(final_doc$ID_Hispanic == 0, 0, 1) ## non hispanic == 0, hispanic == 1 - 5
+final_doc[c("BW_HDLChol", "BW_LDLchol", "BW_Cholhdlcratio", "BW_Triglycerides")] <- lapply(final_doc[c("BW_HDLChol", "BW_LDLchol", "BW_Cholhdlcratio", "BW_Triglycerides")], function(x) as.numeric(as.character(x)))
+
+### 
+# encoding categorical variable for linear model to prevent multicollinearity
+# white == reference; adds "Ethnicity_Black" which == 1 if Black, 0 if not; also adds "Ethnicity_Hispanic" which == 1 if Hispanic, 0 if not 
+# Ethnicity_White is implicitly encoded 
+final_doc <- dummy_cols(final_doc, select_columns = "Ethnicity", remove_first_dummy = TRUE, remove_selected_columns = TRUE)
+# drops original 'Ethnicity' column)
+## sanity check (all should be FALSE)
+sapply(final_doc, is.factor)
+# z-scoring continuous vars
+final_doc[c("Age", "ID_Education", "X01_ICV_HD", "X02_WMH_Volume_LOGGED", "BW_HDLChol", "BW_LDLchol", "BW_Cholhdlcratio", "BW_Triglycerides", "OM_BMI", "CDX_Diabetes", "BW_HBA1c", "IMH_Diabetes", "OM_AbCircumference")] <-
+  lapply(final_doc[c("Age", "ID_Education", "X01_ICV_HD", "X02_WMH_Volume_LOGGED", "BW_HDLChol", "BW_LDLchol", "BW_Cholhdlcratio", "BW_Triglycerides", "OM_BMI", "CDX_Diabetes", "BW_HBA1c", "IMH_Diabetes", "OM_AbCircumference")], function(x) as.numeric(scale(as.numeric(x))))
+# removing Med_ID so it doesn't influence the model as a predictor -- identifiers are not be used as feature in ML models (unless your model is grouping) 
+final_doc <- final_doc[, !names(final_doc) %in% "Med_ID"]
+
+range(CUdata$Age[complete.cases(CUdata[, variables])])
+age_vals <- CUdata$Age[complete.cases(CUdata[, variables])]
+mean(age_vals)
+sd(age_vals)
+
+```
+
+```{r}
+
+# checking dimensionality
+ncol(final_doc) - 1  # subtracts outcome column -- i have 10  
+
+```
+
+## setup ML pipeline
+```{r}
+
+# splitting data into train and test set
+# set seed for reproducibility
+set.seed(101) 
+#creates a sequence up to total # of rows in real dataset -- randomly selecting row #s to be stored in training
+train_rows <- sample(seq_len(nrow(final_doc)), size = 0.7 * nrow(final_doc))
+train_data <- final_doc[train_rows, ]
+test_data  <- final_doc[-train_rows, ]
+
+# classification tasks
+train_data$X01_AB_FBB_AB_pos <- as.factor(train_data$X01_AB_FBB_AB_pos)
+test_data$X01_AB_FBB_AB_pos <- as.factor(test_data$X01_AB_FBB_AB_pos)
+
+task <- TaskClassif$new(id = "amyloid", backend = train_data, target = "X01_AB_FBB_AB_pos")
+
+# defining learners
+lrn_enet   <- lrn("classif.cv_glmnet", predict_type = "prob")
+lrn_rf     <- lrn("classif.ranger", predict_type = "prob")
+lrn_xgb    <- lrn("classif.xgboost", predict_type = "prob")
+lrn_logreg <- lrn("classif.log_reg", predict_type = "prob")
+
+xgb_param_space <- ps(nrounds = p_int(50, 300), eta = p_dbl(0.01, 0.3),max_depth = p_int(2, 6))
+
+# tuning my XGBoost model using inner 3 fold CV (using autotuner)
+auto_xgb <- AutoTuner$new(learner = lrn_xgb,
+  resampling = rsmp("cv", folds = 3), # inner CV
+  measure = msr("classif.auc"), search_space = xgb_param_space, terminator = trm("evals", n_evals = 30), tuner = tnr("random_search"))
+
+auto_xgb$train(task)
+# see best parameters for XGBoost
+print(auto_xgb$tuning_result)
+
+# outer CV benchmark now
+learners <- list(lrn_enet, lrn_rf, lrn_logreg, auto_xgb)
+
+cv10 <- rsmp("cv", folds = 10)
+
+bmr <- benchmark(benchmark_grid(tasks = task, learners = learners, resamplings = cv10))
+
+auc_results <- bmr$aggregate(msr("classif.auc"))
+auc_table <- as.data.frame(auc_results)[, c("learner_id", "classif.auc")]
+
+autoplot(bmr, measure = msr("classif.auc"))
+
+```
+
+```{r}
+
+# ensuring factor
+test_data$X01_AB_FBB_AB_pos <- as.factor(test_data$X01_AB_FBB_AB_pos)
+
+test_task <- TaskClassif$new(id = "amyloid_test", backend = test_data, target = "X01_AB_FBB_AB_pos")
+# defining final ENet model
+enet_final <- lrn("classif.cv_glmnet", predict_type = "prob")
+# train on full training set
+enet_final$train(task)
+# predict on test set
+enet_pred <- enet_final$predict(test_task)
+# compute AUC on test set
+enet_auc <- enet_pred$score(msr("classif.auc"))
+
+# random forest
+rf_final <- lrn("classif.ranger", predict_type = "prob")
+rf_final$train(task)
+rf_pred <- rf_final$predict(test_task)
+rf_auc <- rf_pred$score(msr("classif.auc"))
+
+# logistic regression
+logreg_final <- lrn("classif.log_reg", predict_type = "prob")
+logreg_final$train(task)
+logreg_pred <- logreg_final$predict(test_task)
+logreg_auc <- logreg_pred$score(msr("classif.auc"))
+
+# XGBoost (its already been tuned above)
+xgb_pred <- auto_xgb$predict(test_task)
+xgb_auc <- xgb_pred$score(msr("classif.auc"))
+
+# comparing all AUCs
+data.frame(Model = c("Elastic Net", "Random Forest", "Logistic Regression", "Tuned XGBoost"), Test_AUC = c(enet_auc, rf_auc, logreg_auc, xgb_auc))
+
+
+```
+
+## plot ROC curve
+```{r}
+
+# computing compute the true positive rate (tpr) and false positive rate (fpr) across various thresholds
+# plot ROC and extract data
+
+## ENET
+roc_data <- autoplot(enet_pred, type = "roc", return_data = TRUE)
+print(roc_data)  
+# take underlying data from the ggplot
+roc_df <- roc_data$data
+names(roc_df)[names(roc_df) == "x"] <- "FPR"
+names(roc_df)[names(roc_df) == "y"] <- "TPR"
+# results
+print(data.frame(n_pairs = nrow(roc_df), unique_TPRs = length(unique(roc_df$TPR)), unique_FPRs = length(unique(roc_df$FPR))))
+
+# x-axis: false positive rate (1 – specificity)
+# y-axis: true positive rate (sensitivity / recall)
+# diagonal  line: random guesses (AUC = 0.5)
+
+## RANDOM FOREST
+roc_rf <- autoplot(rf_pred, type = "roc", return_data = TRUE)
+print(roc_rf)
+
+rf_df <- roc_rf$data
+names(rf_df)[names(rf_df) == "x"] <- "FPR"
+names(rf_df)[names(rf_df) == "y"] <- "TPR"
+
+data.frame(Model = "Random Forest", n_pairs = nrow(rf_df), unique_TPRs = length(unique(rf_df$TPR)), unique_FPRs = length(unique(rf_df$FPR)))
+
+## LOGISTIC REGRESSION 
+roc_logreg <- autoplot(logreg_pred, type = "roc", return_data = TRUE)
+print(roc_logreg)
+
+logreg_df <- roc_logreg$data
+names(logreg_df)[names(logreg_df) == "x"] <- "FPR"
+names(logreg_df)[names(logreg_df) == "y"] <- "TPR"
+
+data.frame(Model = "Logistic Regression", n_pairs = nrow(logreg_df), unique_TPRs = length(unique(logreg_df$TPR)), unique_FPRs = length(unique(logreg_df$FPR)))
+
+## TUNED XGBOOST
+roc_xgb <- autoplot(xgb_pred, type = "roc", return_data = TRUE)
+print(roc_xgb)
+
+xgb_df <- roc_xgb$data
+names(xgb_df)[names(xgb_df) == "x"] <- "FPR"
+names(xgb_df)[names(xgb_df) == "y"] <- "TPR"
+
+data.frame(Model = "Tuned XGBoost",n_pairs = nrow(xgb_df),unique_TPRs = length(unique(xgb_df$TPR)),unique_FPRs = length(unique(xgb_df$FPR)))
+
+
+```
+
+## view feature importance
+```{r}
+
+# extracting coefficients
+coef_lasso <- as.matrix(coef(lasso.model$learner.model, s = "lambda.min"))
+coef_ridge <- as.matrix(coef(ridge.model$learner.model, s = "lambda.min"))
+coef_enet  <- as.matrix(coef(enet.model$learner.model, s = "lambda.min"))
+
+# lasso = most selective
+sort(abs(coef_lasso[,1]), decreasing = TRUE)
+# ridge = keeps everything but shrinks weak features
+sort(abs(coef_ridge[,1]), decreasing = TRUE)
+# eNet is kind of in the middle of the other 2
+sort(abs(coef_enet[,1]), decreasing = TRUE)
+
+
+```
